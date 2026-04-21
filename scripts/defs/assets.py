@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import time
 import urllib.request
 from pathlib import Path
 
@@ -15,34 +16,20 @@ else:
 
 DB_PATH = DATA_DIR / "cards.sqlite3"
 
-NETRUNNERDB_API_RUL = "https://api-preview.netrunnerdb.com/api/v3/public/cards"
+NETRUNNERDB_API_URL = "https://api-preview.netrunnerdb.com/api/v3/public/cards"
+
+# Delay between paginated requests so we don't hammer the API.
+REQUEST_DELAY_SECONDS = 0.25
+
+
+def _fetch_page(url: str) -> dict:
+    with urllib.request.urlopen(url) as resp:
+        return json.loads(resp.read())
 
 
 @dg.asset
-def raw_card_json(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
-    CARD_PATH = DATA_DIR / "raw_card_data.json"
-
-    context.log.info(f"Fetching cards from {NETRUNNERDB_API_RUL}")
-
-    with urllib.request.urlopen(NETRUNNERDB_API_RUL) as resp:
-        data = json.loads(resp.read())
-
-    with CARD_PATH.open("w") as f:
-        json.dump(data, f, indent=2)
-
-    record_count = len(data.get("data", []))
-    context.log.info(f"Wrote {record_count} cards to {CARD_PATH}")
-    return dg.MaterializeResult(
-        metadata={
-            "record_count": dg.MetadataValue.int(record_count),
-            "path": dg.MetadataValue.path(CARD_PATH),
-        }
-    )
-
-
-@dg.asset(deps=[raw_card_json])
 def raw_card_db(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
-    context.log.info("Loading raw card data into database")
+    context.log.info(f"Fetching cards from {NETRUNNERDB_API_URL}")
 
     context.log.debug(f"Connecting to {DB_PATH}")
     with sqlite3.connect(DB_PATH) as cxn:
@@ -50,25 +37,60 @@ def raw_card_db(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
         cxn.execute("DROP TABLE IF EXISTS raw")
         cxn.execute("CREATE TABLE raw (card TEXT NOT NULL)")
 
-        context.log.debug("loading cards")
-        event = context.instance.get_latest_materialization_event(
-            dg.AssetKey("raw_card_json")
-        )
-        assert event and event.asset_materialization, (
-            "raw_card_json has not been materialized"
-        )
-        card_path = Path(event.asset_materialization.metadata["path"].value)
-        with card_path.open() as inf:
-            cards = json.load(inf)["data"]
+        total_count: int | None = None
+        loaded = 0
+        page_num = 0
+        next_url: str | None = NETRUNNERDB_API_URL
 
-        cxn.executemany(
-            "INSERT INTO raw(card) VALUES (?)",
-            ((json.dumps(c),) for c in cards),
-        )
+        while next_url is not None:
+            page_num += 1
+            context.log.info(f"Fetching page {page_num}: {next_url}")
+            page = _fetch_page(next_url)
 
-    return dg.MaterializeResult(
-        metadata={"record_count": len(cards), "dbpath": DB_PATH}
-    )
+            if total_count is None:
+                metadata = page.get("metadata") or page.get("meta") or {}
+                for key in ("total_count", "total", "totalCount", "count"):
+                    if key in metadata:
+                        total_count = int(metadata[key])
+                        context.log.info(
+                            f"API reports {total_count} total cards"
+                        )
+                        break
+
+            cards = page.get("data", [])
+            cxn.executemany(
+                "INSERT INTO raw(card) VALUES (?)",
+                ((json.dumps(c),) for c in cards),
+            )
+            loaded += len(cards)
+            context.log.info(
+                f"Inserted {len(cards)} cards from page {page_num} "
+                f"({loaded} total)"
+            )
+
+            next_url = (page.get("links") or {}).get("next")
+            if next_url:
+                time.sleep(REQUEST_DELAY_SECONDS)
+
+        if total_count is not None:
+            assert loaded == total_count, (
+                f"Expected {total_count} cards from API but loaded {loaded}"
+            )
+        else:
+            context.log.warning(
+                "API response did not include a total count; "
+                "skipping completeness check"
+            )
+
+    metadata: dict[str, object] = {
+        "record_count": dg.MetadataValue.int(loaded),
+        "dbpath": DB_PATH,
+        "pages_fetched": dg.MetadataValue.int(page_num),
+    }
+    if total_count is not None:
+        metadata["api_total_count"] = dg.MetadataValue.int(total_count)
+
+    return dg.MaterializeResult(metadata=metadata)
 
 
 @dg.asset(deps=[raw_card_db])
