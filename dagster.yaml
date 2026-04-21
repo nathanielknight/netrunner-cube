@@ -1,0 +1,6 @@
+# Dagster instance configuration
+# https://docs.dagster.io/deployment/dagster-instance
+
+storage:
+  sqlite:
+    base_dir: ".dagster"
